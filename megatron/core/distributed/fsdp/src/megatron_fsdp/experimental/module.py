@@ -42,12 +42,19 @@ class FsdpContext:
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
+    # Stream for the last-microbatch DP-outer reduction (HSDP all-reduce / HFSDP
+    # reduce-scatter). Distinct from reduce_scatter_stream only when
+    # overlap_dp_outer_communication is set, so the DP-outer collective can overlap
+    # the DP-inner reductions; otherwise it aliases reduce_scatter_stream and the
+    # reduction stays serialized.
+    dp_outer_communication_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    overlap_dp_outer_communication: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -59,6 +66,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        overlap_dp_outer_communication: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -68,10 +76,14 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            overlap_dp_outer_communication: Whether the last-microbatch DP-outer reduction
+                runs on its own stream so it can overlap the DP-inner reductions. Ignored
+                when unify_communication_stream is set, since that forces a single stream.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.overlap_dp_outer_communication = overlap_dp_outer_communication
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -84,6 +96,12 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
+        if overlap_dp_outer_communication and not unify_communication_stream:
+            self.dp_outer_communication_stream = torch.cuda.Stream(device)
+        else:
+            # Off by default (or when communication is unified): the DP-outer finalize
+            # shares the reduce-scatter stream, keeping the serialized behavior.
+            self.dp_outer_communication_stream = self.reduce_scatter_stream
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -138,6 +156,10 @@ class FsdpContext:
 
         def post_backward_final_callback() -> None:
             self.current_stream().wait_stream(self.reduce_scatter_stream)
+            # dp_outer_communication_stream aliases reduce_scatter_stream unless overlap
+            # is enabled, in which case the DP-outer reduction finalizes .grad on it, so
+            # order consumers (optimizer.step) after it too. Harmless when they alias.
+            self.current_stream().wait_stream(self.dp_outer_communication_stream)
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
@@ -430,6 +452,10 @@ class FsdpModule:
             # illegal during capture. Later modules are covered by the post-copy
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
+            # The DP-outer reduction stream needs no fork here: it never allocates (the
+            # finalize reuses the persistent main_grad and its view), and it joins any
+            # capture via its wait on the reduce-scatter stream before each finalize in
+            # _reduce_gradient_groups.
 
         self._unshard_parameter_groups()
         assert self._unshard_event is not None
@@ -447,7 +473,12 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Pack gradients and launch their reductions.
+
+        When overlap is enabled, the last-microbatch DP-outer reduction runs on its
+        own stream so a group's DP-outer reduction overlaps the next group's DP-inner
+        reduction; otherwise both share the reduce-scatter stream and stay serialized.
+        """
         context = self.context
         reduce_scatter_stream = context.reduce_scatter_stream
         current_stream = context.current_stream()
@@ -464,7 +495,19 @@ class FsdpModule:
 
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+                group.reduce_dp_inner_gradients(partial_grad)
+
+            if not context.is_last_microbatch:
+                continue
+            # Finalize the DP-outer reduction. When overlap is enabled its stream is
+            # distinct, so it overlaps the following group's DP-inner reduce; the
+            # finalize only reads the persistent accumulator, so it stays alive across
+            # the handoff. When disabled the stream aliases reduce_scatter_stream and
+            # this stays serialized.
+            if context.dp_outer_communication_stream is not reduce_scatter_stream:
+                context.dp_outer_communication_stream.wait_stream(reduce_scatter_stream)
+            with torch.cuda.stream(context.dp_outer_communication_stream):
+                group.finalize_dp_outer_reduction()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
