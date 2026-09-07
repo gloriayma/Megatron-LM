@@ -1043,7 +1043,9 @@ def apply_router_token_dropping(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             - final_probs: Routing probabilities after applying capacity constraints
-            - final_map: Boolean mask after applying capacity constraints
+            - final_map: Boolean mask after applying capacity constraints. Under
+              pad_to_capacity this is the capacity mask itself, so it selects exactly
+              expert_capacity tokens per expert and no longer reflects the router's choices.
     """
     assert routing_probs.ndim == 2 and routing_map.ndim == 2
     num_tokens, num_experts = routing_probs.shape

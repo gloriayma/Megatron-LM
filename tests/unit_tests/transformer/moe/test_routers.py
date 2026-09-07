@@ -355,6 +355,76 @@ class TestTop2Router:
         self.router.config.moe_pad_expert_input_to_capacity = False
 
 
+class TestExpertBiasWithTokenDropping:
+    """Expert bias combined with moe_expert_capacity_factor / moe_pad_expert_input_to_capacity."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        num_moe_experts = 8
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_bias_update_rate=0.1,
+            moe_router_topk=2,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        self.router = cast(Router, MoELayer(self.transformer_config, submodules).router)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bias_updates_with_capacity_padding(self):
+        """pad_to_capacity hands the router the capacity mask, which is uniform by construction."""
+        self.router = self.router.cuda()
+        self.router.config.moe_expert_capacity_factor = 1.0
+        self.router.config.moe_pad_expert_input_to_capacity = True
+
+        self.router(torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16())
+
+        counts = self.router.local_tokens_per_expert
+        assert counts.min() != counts.max(), "counted load is uniform, so the bias cannot move"
+
+        initial_bias = self.router.expert_bias.clone()
+        updated_bias = get_updated_expert_bias(
+            counts.clone(), self.router.expert_bias, self.router.config.moe_router_bias_update_rate
+        )
+        assert not torch.equal(initial_bias, updated_bias), "Expert bias should be updated"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("pad_to_capacity", [False, True])
+    def test_bias_counts_independent_of_capacity(self, pad_to_capacity):
+        """Capacity dropping is a dispatcher concern; it must not change what the bias counts."""
+        self.router = self.router.cuda()
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+
+        self.router.config.moe_expert_capacity_factor = None
+        self.router(hidden_states)
+        dropless_counts = self.router.local_tokens_per_expert.clone()
+
+        self.router.local_tokens_per_expert.zero_()
+        self.router.config.moe_expert_capacity_factor = 1.0
+        self.router.config.moe_pad_expert_input_to_capacity = pad_to_capacity
+        self.router(hidden_states)
+
+        assert torch.equal(self.router.local_tokens_per_expert, dropless_counts)
+
+
 class TestGroupLimitedRouter:
     def setup_method(self, method):
         Utils.initialize_model_parallel(

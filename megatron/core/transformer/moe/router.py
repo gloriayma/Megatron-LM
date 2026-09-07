@@ -793,6 +793,10 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
+        # The expert bias steers routing decisions, so it counts the router's own map: under
+        # pad_to_capacity, routing_map becomes the capacity mask, which is uniform by construction.
+        routed_map = routing_map
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -836,7 +840,7 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(routed_map, padding_mask=padding_mask)
 
         return probs, routing_map
 
